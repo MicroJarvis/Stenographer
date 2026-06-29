@@ -57,8 +57,8 @@ final class SpeakerDiarizationService: ObservableObject {
     @Published private(set) var statusText = "待分析"
 
     let modelName = "FunASR CAM++"
-    private let liveWindowSeconds = 45
-    private let liveHopSeconds = 15
+    private let liveWindowSeconds = 24
+    private let liveHopSeconds = 8
     private var liveWorker: Process?
     private var liveInputPipe: Pipe?
     private var liveSegmenter: LiveSpeakerAudioSegmenter?
@@ -131,7 +131,9 @@ final class SpeakerDiarizationService: ObservableObject {
         process.executableURL = invocation.executableURL
         process.arguments = invocation.arguments + [
             workerURL.path,
-            "--library", libraryPath
+            "--library", libraryPath,
+            "--threshold", "0.80",
+            "--short-cluster-distance", "0.36"
         ]
         process.environment = processEnvironment()
 

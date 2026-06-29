@@ -128,6 +128,8 @@ final class MeetingStore: ObservableObject {
     private var whisperLiveEntriesByMeeting: [Meeting.ID: [UUID: [TranscriptEntry]]] = [:]
     private var liveSpeakerEntriesByMeeting: [Meeting.ID: [UUID: [TranscriptEntry]]] = [:]
     private var speakerEmbeddingByID: [Speaker.ID: [Double]] = [:]
+    private var rememberedVoiceprintIDs = Set<Speaker.ID>()
+    private let speakerTrackManager = SpeakerTrackManager()
 
     init(seed: SampleSeed = .default) {
         let storedSnapshots = MeetingFileStore.shared.loadSnapshots()
@@ -306,6 +308,10 @@ final class MeetingStore: ObservableObject {
         qwenLiveEntriesByMeeting[newMeeting.id] = [:]
         whisperLiveEntriesByMeeting[newMeeting.id] = [:]
         liveSpeakerEntriesByMeeting[newMeeting.id] = [:]
+        speakerTrackManager.reset(
+            rememberedSpeakers: speakers.filter { rememberedVoiceprintIDs.contains($0.id) },
+            embeddingsByID: speakerEmbeddingByID
+        )
         lastErrorMessage = nil
         lastLiveTranscriptionSecond = 0
         qwenRefiner.reset()
@@ -517,8 +523,12 @@ final class MeetingStore: ObservableObject {
                 speakers[targetIndex].role = "已合并声纹"
             }
             speakers[targetIndex].confidence = maxConfidence(target.confidence, source.confidence)
+            if let embedding = speakerEmbeddingByID[targetID] {
+                speakerTrackManager.remember(speaker: speakers[targetIndex], embedding: embedding)
+            }
             saveVoiceprint(for: speakers[targetIndex])
         }
+        speakerTrackManager.merge(sourceID: sourceID, into: targetID)
         deleteVoiceprint(sourceID)
 
         for index in meetings.indices {
@@ -736,64 +746,7 @@ final class MeetingStore: ObservableObject {
     }
 
     private func reconcileLiveSpeakerResult(_ result: SpeakerDiarizationResult, meetingID: Meeting.ID) -> SpeakerDiarizationResult {
-        let sessionSpeakerIDs = Set(speakerEmbeddingByID.keys)
-        var idMap: [Speaker.ID: Speaker.ID] = [:]
-        var mergedSpeakersByID: [Speaker.ID: RecognizedSpeaker] = [:]
-
-        for var recognized in result.speakers {
-            if let matchedID = bestSessionSpeakerMatch(for: recognized, candidates: sessionSpeakerIDs) {
-                idMap[recognized.id] = matchedID
-                if let existing = speakers.first(where: { $0.id == matchedID }) {
-                    recognized.id = matchedID
-                    recognized.name = existing.name
-                    recognized.voiceprint = existing.voiceprint
-                    recognized.role = existing.role
-                    recognized.confidence = recognized.similarity.map { "\(max(0, min(99, Int(round($0 * 100)))))%" } ?? existing.confidence
-                }
-                mergeEmbedding(recognized.embedding, into: matchedID)
-            } else {
-                idMap[recognized.id] = recognized.id
-            }
-            mergedSpeakersByID[recognized.id] = recognized
-        }
-
-        let segments = result.segments.map { segment in
-            var updated = segment
-            updated.speakerID = idMap[segment.speakerID] ?? segment.speakerID
-            return updated
-        }
-
-        let transcript = result.transcript.map { entry in
-            var updated = entry
-            updated.speakerID = idMap[entry.speakerID] ?? entry.speakerID
-            return updated
-        }
-
-        return SpeakerDiarizationResult(
-            speakers: Array(mergedSpeakersByID.values),
-            segments: segments,
-            transcript: transcript
-        )
-    }
-
-    private func bestSessionSpeakerMatch(for recognized: RecognizedSpeaker, candidates: Set<Speaker.ID>) -> Speaker.ID? {
-        guard !recognized.embedding.isEmpty else { return nil }
-        let threshold = 0.72
-        var bestID: Speaker.ID?
-        var bestScore = -1.0
-
-        for candidateID in candidates {
-            guard let embedding = speakerEmbeddingByID[candidateID], embedding.count == recognized.embedding.count else {
-                continue
-            }
-            let score = Self.cosineSimilarity(recognized.embedding, embedding)
-            if score > bestScore {
-                bestScore = score
-                bestID = candidateID
-            }
-        }
-
-        return bestScore >= threshold ? bestID : nil
+        reconcileSpeakerResult(result)
     }
 
     private func mergeEmbedding(_ embedding: [Double], into speakerID: Speaker.ID) {
@@ -964,22 +917,24 @@ final class MeetingStore: ObservableObject {
     }
 
     private func applySpeakerDiarization(_ result: SpeakerDiarizationResult, meetingID: Meeting.ID) {
-        for recognized in result.speakers {
+        let reconciled = reconcileSpeakerResult(result)
+
+        for recognized in reconciled.speakers {
             speakerEmbeddingByID[recognized.id] = recognized.embedding
             upsertSpeaker(from: recognized)
         }
 
         let existingEntries = transcriptByMeeting[meetingID, default: []]
-        let diarizedEntries = normalizeTranscript(result.transcript)
+        let diarizedEntries = normalizeTranscript(reconciled.transcript)
         let detectedSpeakerCount = [
-            result.speakers.count,
-            Set(result.segments.map(\.speakerID)).count,
+            reconciled.speakers.count,
+            Set(reconciled.segments.map(\.speakerID)).count,
             Set(diarizedEntries.map(\.speakerID)).count
         ].max() ?? 0
 
         let entries: [TranscriptEntry]
         if !existingEntries.isEmpty {
-            entries = assignSpeakers(entries: existingEntries, using: result.segments)
+            entries = assignSpeakers(entries: existingEntries, using: reconciled.segments)
         } else if !diarizedEntries.isEmpty {
             entries = diarizedEntries
         } else {
@@ -998,6 +953,14 @@ final class MeetingStore: ObservableObject {
             }
             persistMeetingSnapshot(meetings[index])
         }
+    }
+
+    private func reconcileSpeakerResult(_ result: SpeakerDiarizationResult) -> SpeakerDiarizationResult {
+        speakerTrackManager.reconcile(
+            result,
+            knownSpeakers: speakers,
+            rememberedSpeakerIDs: rememberedVoiceprintIDs
+        )
     }
 
     private func meetingSpeakerIDs(for meetingID: Meeting.ID) -> Set<Speaker.ID> {
@@ -1029,10 +992,16 @@ final class MeetingStore: ObservableObject {
     private func upsertSpeaker(from recognized: RecognizedSpeaker) {
         let tint = speakerTint(for: recognized.id)
         if let index = speakers.firstIndex(where: { $0.id == recognized.id }) {
-            speakers[index].name = recognized.name
-            speakers[index].voiceprint = recognized.voiceprint
-            speakers[index].role = recognized.role
-            speakers[index].confidence = recognized.confidence
+            if speakers[index].isUnnamed || !recognized.name.isUnnamedVoiceName {
+                speakers[index].name = recognized.name
+            }
+            if speakers[index].voiceprint == "VP-UNKNOWN" || !recognized.voiceprint.isEmpty {
+                speakers[index].voiceprint = recognized.voiceprint
+            }
+            if speakers[index].role == "待确认" || speakers[index].role.hasPrefix("临时") || recognized.role == "已记忆声纹" {
+                speakers[index].role = recognized.role
+            }
+            speakers[index].confidence = maxConfidence(speakers[index].confidence, recognized.confidence)
             return
         }
 
@@ -1103,22 +1072,24 @@ final class MeetingStore: ObservableObject {
     private func loadVoiceprintLibrary() {
         for record in MeetingFileStore.shared.loadVoiceprintLibrary() {
             speakerEmbeddingByID[record.id] = record.embedding
+            rememberedVoiceprintIDs.insert(record.id)
             if let index = speakers.firstIndex(where: { $0.id == record.id }) {
                 speakers[index].name = record.name
                 speakers[index].voiceprint = record.voiceprint
                 speakers[index].role = record.role
                 speakers[index].confidence = record.confidence
+                speakerTrackManager.remember(speaker: speakers[index], embedding: record.embedding)
             } else {
-                speakers.append(
-                    Speaker(
-                        id: record.id,
-                        name: record.name,
-                        voiceprint: record.voiceprint,
-                        role: record.role,
-                        tint: speakerTint(for: record.id),
-                        confidence: record.confidence
-                    )
+                let speaker = Speaker(
+                    id: record.id,
+                    name: record.name,
+                    voiceprint: record.voiceprint,
+                    role: record.role,
+                    tint: speakerTint(for: record.id),
+                    confidence: record.confidence
                 )
+                speakers.append(speaker)
+                speakerTrackManager.remember(speaker: speaker, embedding: record.embedding)
             }
         }
     }
@@ -1136,6 +1107,8 @@ final class MeetingStore: ObservableObject {
         )
         do {
             try MeetingFileStore.shared.upsertVoiceprint(record)
+            rememberedVoiceprintIDs.insert(speaker.id)
+            speakerTrackManager.remember(speaker: speaker, embedding: embedding)
         } catch {
             lastErrorMessage = error.localizedDescription
         }
@@ -1146,6 +1119,8 @@ final class MeetingStore: ObservableObject {
         records.removeAll { $0.id == speakerID }
         do {
             try MeetingFileStore.shared.writeVoiceprintLibrary(records)
+            rememberedVoiceprintIDs.remove(speakerID)
+            speakerTrackManager.forget(speakerID)
         } catch {
             lastErrorMessage = error.localizedDescription
         }
@@ -1269,6 +1244,13 @@ private final class PCMChunkFanout: @unchecked Sendable {
         let currentHandlers = handlers
         lock.unlock()
         currentHandlers.forEach { $0(data) }
+    }
+}
+
+private extension String {
+    var isUnnamedVoiceName: Bool {
+        let normalized = trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty || normalized == "未命名声纹" || normalized.hasPrefix("未命名声纹 ")
     }
 }
 
