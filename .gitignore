@@ -10,6 +10,22 @@
 __pycache__/
 *.py[cod]
 
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+secrets/
+Secrets/
+*.secret
+*.secrets
+*.key
+*.pem
+*.p8
+*.local
+*.local.*
+LocalSettings.*
+local.settings.*
+
 # Generated macOS app bundles
 *.app/
 
@@ -30,4 +46,3 @@ Models/**
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
-
