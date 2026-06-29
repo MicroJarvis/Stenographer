@@ -1,0 +1,33 @@
+.DS_Store
+
+# SwiftPM build output
+.build/
+.swiftpm/
+
+# Local Python environments and caches
+.venv/
+.venv-qwen/
+__pycache__/
+*.py[cod]
+
+# Generated macOS app bundles
+*.app/
+
+# Local models and downloaded weights
+Models/**
+!Models/
+!Models/README.md
+*.gguf
+*.safetensors
+*.onnx
+*.bin
+
+# Local recordings and voiceprint databases
+*.caf
+*.wav
+*.mp3
+*.flac
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
