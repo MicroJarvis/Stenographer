@@ -405,15 +405,15 @@ struct RecordingHeader: View {
 
             HStack(spacing: 10) {
                 EnginePill(title: "录音", value: store.selectedMeeting?.status == .live ? "写入中" : "已保存", systemImage: "record.circle", tint: .red)
-                EnginePill(title: "FunASR ONNX", value: store.transcriptionStatusText, systemImage: "waveform", tint: store.streamingTranscriber.isRunning ? .blue : .secondary)
-                EnginePill(title: "Qwen3-ASR", value: store.qwenRefiner.statusText, systemImage: "wand.and.sparkles", tint: store.qwenRefiner.isRunning ? .blue : .orange)
+                EnginePill(title: "实时字幕", value: store.transcriptionStatusText, systemImage: "waveform", tint: store.streamingTranscriber.isRunning ? .blue : .secondary)
+                EnginePill(title: "正文增强", value: enhancementStatus, systemImage: "wand.and.sparkles", tint: store.qwenRefiner.isRunning ? .blue : (store.selectedMeetingHasEnhancedEntries ? .green : .orange))
                 EnginePill(
-                    title: "声纹",
-                    value: (store.speakerDiarizer.isRunning || store.speakerDiarizer.isLiveRunning) ? store.speakerDiarizer.statusText : "\(store.selectedMeeting?.speakerCount ?? 0) 个轨道",
+                    title: "说话人",
+                    value: (store.speakerDiarizer.isRunning || store.speakerDiarizer.isLiveRunning) ? "匹配中" : "\(store.selectedMeeting?.speakerCount ?? 0) 个轨道",
                     systemImage: "person.wave.2",
                     tint: (store.speakerDiarizer.isRunning || store.speakerDiarizer.isLiveRunning) ? .blue : .purple
                 )
-                EnginePill(title: "翻译", value: "中文输出", systemImage: "character.book.closed", tint: .green)
+                EnginePill(title: "中文翻译", value: "自动", systemImage: "character.book.closed", tint: .green)
             }
 
             WaveformView(
@@ -422,6 +422,16 @@ struct RecordingHeader: View {
             )
                 .frame(height: 42)
         }
+    }
+
+    private var enhancementStatus: String {
+        if store.qwenRefiner.isRunning {
+            return "后台增强中"
+        }
+        if store.selectedMeetingHasEnhancedEntries {
+            return "已写入正文"
+        }
+        return "等待片段"
     }
 }
 
@@ -497,17 +507,16 @@ struct TranscriptEntryRow: View {
                 .padding(.top, 4)
 
             VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 8) {
-                    SpeakerBadge(speaker: speaker)
-                    Text(entry.sourceLanguage)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(.quaternary, in: Capsule())
-                    Text("置信度 \(entry.confidence)")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) {
+                        speakerHeader
+                        statusTags
+                    }
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        speakerHeader
+                        statusTags
+                    }
                 }
 
                 Text(entry.original)
@@ -542,6 +551,100 @@ struct TranscriptEntryRow: View {
             .padding(.vertical, 14)
         }
     }
+
+    private var speakerHeader: some View {
+        SpeakerBadge(speaker: speaker)
+    }
+
+    private var statusTags: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                statusTagViews
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    TranscriptStatusTag(title: entry.sourceLanguage, systemImage: "globe.asia.australia", tint: .secondary)
+                    TranscriptStatusTag(
+                        title: transcriptionStatus.title,
+                        systemImage: transcriptionStatus.systemImage,
+                        tint: transcriptionStatus.tint
+                    )
+                }
+                HStack(spacing: 8) {
+                    TranscriptStatusTag(
+                        title: translationStatus.title,
+                        systemImage: translationStatus.systemImage,
+                        tint: translationStatus.tint
+                    )
+                    TranscriptStatusTag(
+                        title: speakerStatus.title,
+                        systemImage: speakerStatus.systemImage,
+                        tint: speakerStatus.tint
+                    )
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var statusTagViews: some View {
+        TranscriptStatusTag(title: entry.sourceLanguage, systemImage: "globe.asia.australia", tint: .secondary)
+        TranscriptStatusTag(
+            title: transcriptionStatus.title,
+            systemImage: transcriptionStatus.systemImage,
+            tint: transcriptionStatus.tint
+        )
+        TranscriptStatusTag(
+            title: translationStatus.title,
+            systemImage: translationStatus.systemImage,
+            tint: translationStatus.tint
+        )
+        TranscriptStatusTag(
+            title: speakerStatus.title,
+            systemImage: speakerStatus.systemImage,
+            tint: speakerStatus.tint
+        )
+    }
+
+    private var transcriptionStatus: TranscriptRowStatus {
+        if entry.confidence.hasPrefix("qwen3-asr") {
+            return TranscriptRowStatus(title: "Qwen 已增强", systemImage: "wand.and.sparkles", tint: .blue)
+        }
+        if entry.confidence.hasPrefix("whisper-large") {
+            return TranscriptRowStatus(title: "Whisper 补全", systemImage: "waveform.badge.magnifyingglass", tint: .purple)
+        }
+        if entry.confidence == "nano-gguf" {
+            return TranscriptRowStatus(title: "Nano GGUF", systemImage: "waveform.badge.magnifyingglass", tint: .purple)
+        }
+        if entry.confidence == "merged" {
+            return TranscriptRowStatus(title: "已合并正文", systemImage: "arrow.triangle.merge", tint: .secondary)
+        }
+        if entry.confidence == "stream" || entry.confidence == "final" {
+            return TranscriptRowStatus(title: "实时草稿", systemImage: "dot.radiowaves.left.and.right", tint: .orange)
+        }
+        return TranscriptRowStatus(title: "已转写", systemImage: "text.badge.checkmark", tint: .secondary)
+    }
+
+    private var translationStatus: TranscriptRowStatus {
+        guard entry.sourceLanguage != "中文" else {
+            return TranscriptRowStatus(title: "中文正文", systemImage: "character.cursor.ibeam", tint: .secondary)
+        }
+
+        let translation = entry.translation.trimmingCharacters(in: .whitespacesAndNewlines)
+        let original = entry.original.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !translation.isEmpty && translation != original {
+            return TranscriptRowStatus(title: "已翻译", systemImage: "character.book.closed", tint: .green)
+        }
+        return TranscriptRowStatus(title: "待翻译", systemImage: "character.book.closed", tint: .orange)
+    }
+
+    private var speakerStatus: TranscriptRowStatus {
+        if speaker.isUnnamed {
+            return TranscriptRowStatus(title: "声纹待确认", systemImage: "person.crop.circle.badge.questionmark", tint: .orange)
+        }
+        return TranscriptRowStatus(title: "声纹已回填", systemImage: "person.wave.2", tint: .purple)
+    }
 }
 
 struct SpeakerBadge: View {
@@ -556,6 +659,29 @@ struct SpeakerBadge: View {
                 .font(.subheadline)
                 .fontWeight(.medium)
         }
+    }
+}
+
+struct TranscriptRowStatus {
+    var title: String
+    var systemImage: String
+    var tint: Color
+}
+
+struct TranscriptStatusTag: View {
+    let title: String
+    let systemImage: String
+    let tint: Color
+
+    var body: some View {
+        Label(title, systemImage: systemImage)
+            .labelStyle(.titleAndIcon)
+            .font(.caption2)
+            .foregroundStyle(tint)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(.quaternary, in: Capsule())
+            .help(title)
     }
 }
 
@@ -635,6 +761,8 @@ struct SpeakersPanel: View {
                     if shouldShow(speaker) {
                         SpeakerMemoryRow(
                             speaker: $speaker,
+                            usageStats: store.speakerUsageStats(for: speaker.id),
+                            memoryLabel: store.speakerMemoryLabel(for: speaker.id),
                             canMerge: store.speakers.count > 1,
                             onCommit: { name in
                                 store.updateSpeakerName(
@@ -686,13 +814,13 @@ struct SpeakersPanel: View {
     }
 
     private var panelTitle: String {
-        scope == .library ? "声纹库" : "声纹记忆"
+        scope == .library ? "声纹库" : "说话人审核"
     }
 
     private var panelSubtitle: String {
         switch scope {
         case .meeting:
-            return "FunASR CAM++ 本地分离说话人，命名后可回写到未来会议"
+            return "核对本场声纹、命名未知说话人并合并重复身份"
         case .library:
             return "管理本机保存的说话人名称，并将重复声纹合并到同一身份"
         }
@@ -772,17 +900,20 @@ struct SpeakerMergePanel: View {
 
 struct SpeakerMemoryRow: View {
     @Binding var speaker: Speaker
+    var usageStats: SpeakerUsageStats
+    var memoryLabel: String
     var canMerge: Bool
     var onCommit: (String) -> Void
     var onMerge: (Speaker.ID) -> Void
 
     var body: some View {
-        HStack(alignment: .center, spacing: 10) {
+        HStack(alignment: .top, spacing: 10) {
             Circle()
                 .fill(speaker.tint)
                 .frame(width: 12, height: 12)
+                .padding(.top, 6)
 
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 6) {
                 TextField("声纹名称", text: $speaker.name)
                     .textFieldStyle(.plain)
                     .font(.headline)
@@ -793,15 +924,17 @@ struct SpeakerMemoryRow: View {
                         onCommit(newValue)
                     }
 
-                Text("\(speaker.role) · \(speaker.voiceprint)")
+                speakerMetaTags
+
+                Label(usageStats.summary, systemImage: usageStats.isInCurrentMeeting ? "clock.badge.checkmark" : "clock")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(usageStats.isInCurrentMeeting ? .secondary : .tertiary)
             }
 
             Spacer()
 
             VStack(alignment: .trailing, spacing: 6) {
-                Text(speaker.confidence)
+                Text("匹配 \(speaker.confidence)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -815,6 +948,55 @@ struct SpeakerMemoryRow: View {
             }
         }
         .padding(.vertical, 6)
+    }
+
+    private var memoryIcon: String {
+        memoryLabel == "已记忆" ? "checkmark.seal" : "person.badge.clock"
+    }
+
+    private var memoryTint: Color {
+        memoryLabel == "已记忆" ? .green : .orange
+    }
+
+    private var speakerMetaTags: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 6) {
+                speakerStateTagViews
+            }
+
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    SpeakerStateTag(title: memoryLabel, systemImage: memoryIcon, tint: memoryTint)
+                    SpeakerStateTag(title: speaker.role, systemImage: "person.text.rectangle", tint: .secondary)
+                }
+                SpeakerStateTag(title: speaker.voiceprint, systemImage: "waveform.path", tint: .secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var speakerStateTagViews: some View {
+        SpeakerStateTag(title: memoryLabel, systemImage: memoryIcon, tint: memoryTint)
+        SpeakerStateTag(title: speaker.role, systemImage: "person.text.rectangle", tint: .secondary)
+        SpeakerStateTag(title: speaker.voiceprint, systemImage: "waveform.path", tint: .secondary)
+    }
+}
+
+struct SpeakerStateTag: View {
+    let title: String
+    let systemImage: String
+    let tint: Color
+
+    var body: some View {
+        Label(title, systemImage: systemImage)
+            .labelStyle(.titleAndIcon)
+            .font(.caption2)
+            .foregroundStyle(tint)
+            .lineLimit(1)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(.quaternary, in: Capsule())
+            .help(title)
     }
 }
 

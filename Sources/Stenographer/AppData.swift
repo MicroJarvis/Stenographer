@@ -100,6 +100,36 @@ struct EngineItem: Identifiable {
     var tint: Color
 }
 
+struct SpeakerUsageStats {
+    var entryCount: Int
+    var durationSeconds: Int
+    var lastTime: String?
+    var isInCurrentMeeting: Bool
+
+    var summary: String {
+        guard entryCount > 0 else {
+            return isInCurrentMeeting ? "本场已出现" : "未出现在当前会议"
+        }
+        var parts = ["本场 \(entryCount) 段"]
+        if durationSeconds > 0 {
+            parts.append(durationLabel)
+        }
+        if let lastTime {
+            parts.append("最近 \(lastTime)")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private var durationLabel: String {
+        let minutes = durationSeconds / 60
+        let seconds = durationSeconds % 60
+        if minutes > 0 {
+            return "\(minutes)分\(seconds)秒"
+        }
+        return "\(seconds)秒"
+    }
+}
+
 @MainActor
 final class MeetingStore: ObservableObject {
     @Published var meetings: [Meeting]
@@ -185,6 +215,10 @@ final class MeetingStore: ObservableObject {
     var selectedMeetingSpeakerIDs: Set<Speaker.ID> {
         guard let selectedMeetingID else { return [] }
         return meetingSpeakerIDs(for: selectedMeetingID)
+    }
+
+    var selectedMeetingHasEnhancedEntries: Bool {
+        selectedMeetingEntries.contains { $0.confidence.hasPrefix("qwen3-asr") }
     }
 
     var pauseButtonTitle: String {
@@ -294,6 +328,34 @@ final class MeetingStore: ObservableObject {
     func selectedMeetingLiveSpeakerIDs() -> Set<Speaker.ID> {
         guard let selectedMeetingID else { return [] }
         return meetingSpeakerIDs(for: selectedMeetingID)
+    }
+
+    func speakerUsageStats(for speakerID: Speaker.ID) -> SpeakerUsageStats {
+        guard let selectedMeetingID else {
+            return SpeakerUsageStats(entryCount: 0, durationSeconds: 0, lastTime: nil, isInCurrentMeeting: false)
+        }
+
+        let entries = transcriptByMeeting[selectedMeetingID, default: []]
+            .filter { $0.speakerID == speakerID }
+        let durationMS = entries.reduce(0) { total, entry in
+            let start = entry.startMS ?? Self.milliseconds(from: entry.time)
+            let end = entry.endMS ?? start
+            return total + max(0, end - start)
+        }
+        let latest = entries.max { lhs, rhs in
+            (lhs.endMS ?? lhs.startMS ?? Self.milliseconds(from: lhs.time))
+                < (rhs.endMS ?? rhs.startMS ?? Self.milliseconds(from: rhs.time))
+        }
+        return SpeakerUsageStats(
+            entryCount: entries.count,
+            durationSeconds: durationMS / 1_000,
+            lastTime: latest?.time,
+            isInCurrentMeeting: selectedMeetingSpeakerIDs.contains(speakerID)
+        )
+    }
+
+    func speakerMemoryLabel(for speakerID: Speaker.ID) -> String {
+        rememberedVoiceprintIDs.contains(speakerID) ? "已记忆" : "仅本次会议"
     }
 
     func startNewRecording() {
