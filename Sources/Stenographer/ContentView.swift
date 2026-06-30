@@ -247,6 +247,7 @@ struct StatusDot: View {
 struct TranscriptWorkspace: View {
     @ObservedObject var store: MeetingStore
     var openSpeakers: () -> Void
+    @AppStorage("Stenographer.LiveDraftExpanded") private var isLiveDraftExpanded = true
 
     var body: some View {
         VStack(spacing: 0) {
@@ -260,10 +261,11 @@ struct TranscriptWorkspace: View {
             LiveDraftStrip(
                 draft: store.selectedMeetingLiveDraftEntry,
                 speaker: store.selectedMeetingLiveDraftEntry.map { store.speaker(for: $0.speakerID) },
-                isStreaming: store.streamingTranscriber.isRunning || store.qwenRefiner.isRunning || store.speakerDiarizer.isLiveRunning
+                isStreaming: store.streamingTranscriber.isRunning || store.qwenRefiner.isRunning || store.speakerDiarizer.isLiveRunning,
+                isExpanded: $isLiveDraftExpanded
             )
             .padding(.horizontal, 24)
-            .padding(.vertical, 14)
+            .padding(.vertical, 8)
 
             Divider()
 
@@ -315,9 +317,10 @@ struct LiveDraftStrip: View {
     let draft: TranscriptEntry?
     let speaker: Speaker?
     let isStreaming: Bool
+    @Binding var isExpanded: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Label("实时草稿", systemImage: "dot.radiowaves.left.and.right")
                     .font(.headline)
@@ -325,9 +328,17 @@ struct LiveDraftStrip: View {
                 Text(isStreaming ? "直播中" : "等待输入")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Button {
+                    isExpanded.toggle()
+                } label: {
+                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help(isExpanded ? "收起实时草稿" : "展开实时草稿")
             }
 
-            if let draft {
+            if isExpanded, let draft {
                 HStack(alignment: .top, spacing: 18) {
                     Text(draft.time)
                         .font(.system(.caption, design: .monospaced))
@@ -354,25 +365,26 @@ struct LiveDraftStrip: View {
                         }
 
                         Text(draft.original)
-                            .font(.body)
+                            .font(.callout)
                             .foregroundStyle(.secondary)
                             .italic()
+                            .lineLimit(2)
                             .textSelection(.enabled)
                     }
-                    .padding(.vertical, 14)
+                    .padding(.vertical, 6)
                 }
-                .padding(.horizontal, 24)
-            } else {
+                .padding(.horizontal, 12)
+            } else if isExpanded {
                 ContentUnavailableView(
                     "暂无实时草稿",
                     systemImage: "text.quote",
                     description: Text("录音开始后，实时转写会固定显示在这里。")
                 )
-                .frame(maxWidth: .infinity, minHeight: 120)
-                .padding(.horizontal, 24)
+                .frame(maxWidth: .infinity, minHeight: 56)
+                .padding(.horizontal, 12)
             }
         }
-        .padding(.top, 6)
+        .padding(.top, 2)
     }
 }
 
