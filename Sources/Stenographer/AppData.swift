@@ -133,6 +133,7 @@ final class MeetingStore: ObservableObject {
     private var speakerEmbeddingByID: [Speaker.ID: [Double]] = [:]
     private var rememberedVoiceprintIDs = Set<Speaker.ID>()
     private var placeholderSpeakerIDsByMeeting: [Meeting.ID: Speaker.ID] = [:]
+    private var translationEntryIDsInFlight = Set<TranscriptEntry.ID>()
     private let speakerTrackManager = SpeakerTrackManager()
 
     init(seed: SampleSeed = .default) {
@@ -214,6 +215,10 @@ final class MeetingStore: ObservableObject {
     var canRunNanoGGUFSelectedMeeting: Bool {
         guard let selectedMeeting, selectedMeeting.audioFilePath != nil else { return false }
         return selectedMeeting.status != .live && !nanoGGUF.isRunning
+    }
+
+    var canTranslateSelectedMeeting: Bool {
+        !entriesNeedingTranslation(selectedMeetingEntries).isEmpty && !openAISummary.isRunning
     }
 
     var canAnalyzeSpeakersSelectedMeeting: Bool {
@@ -468,6 +473,16 @@ final class MeetingStore: ObservableObject {
         } else if selectedMeetingEntries.isEmpty {
             lastErrorMessage = "还没有真实转写内容，无法生成会议纪要。"
         }
+    }
+
+    func translateSelectedMeeting() {
+        guard let selectedMeetingID else { return }
+        let entries = entriesNeedingTranslation(transcriptByMeeting[selectedMeetingID, default: []])
+        guard !entries.isEmpty else {
+            lastErrorMessage = "当前会议没有需要翻译成中文的外语片段。"
+            return
+        }
+        translateEntries(entries, meetingID: selectedMeetingID, persist: true)
     }
 
     func runNanoGGUFOnSelectedMeeting() {
@@ -785,6 +800,7 @@ final class MeetingStore: ObservableObject {
 
         qwenLiveEntriesByMeeting[meetingID, default: [:]][update.commandID] = normalizedEntries
         rebuildLiveTranscript(for: meetingID)
+        translateEntriesIfNeeded(normalizedEntries, meetingID: meetingID)
 
         if let index = meetings.firstIndex(where: { $0.id == meetingID }) {
             meetings[index].speakerCount = max(1, Set(transcriptByMeeting[meetingID, default: []].map(\.speakerID)).count)
@@ -801,6 +817,7 @@ final class MeetingStore: ObservableObject {
 
         whisperLiveEntriesByMeeting[meetingID, default: [:]][update.commandID] = normalizedEntries
         rebuildLiveTranscript(for: meetingID)
+        translateEntriesIfNeeded(normalizedEntries, meetingID: meetingID)
 
         if let index = meetings.firstIndex(where: { $0.id == meetingID }) {
             meetings[index].speakerCount = max(1, Set(transcriptByMeeting[meetingID, default: []].map(\.speakerID)).count)
@@ -825,6 +842,7 @@ final class MeetingStore: ObservableObject {
         updateLiveDraftSpeaker(for: meetingID, using: entries)
         liveSpeakerEntriesByMeeting[meetingID, default: [:]][update.commandID] = entries
         rebuildLiveTranscript(for: meetingID)
+        translateEntriesIfNeeded(entries, meetingID: meetingID)
 
         if let index = meetings.firstIndex(where: { $0.id == meetingID }) {
             let speakerCount = [
@@ -1000,6 +1018,97 @@ final class MeetingStore: ObservableObject {
                 normalized.speakerID = fallbackSpeakerID(for: meetingID)
             }
             return normalized
+        }
+    }
+
+    private func translateEntriesIfNeeded(_ entries: [TranscriptEntry], meetingID: Meeting.ID) {
+        let pendingEntries = entriesNeedingTranslation(entries)
+            .filter { !translationEntryIDsInFlight.contains($0.id) }
+        guard !pendingEntries.isEmpty else { return }
+        translateEntries(pendingEntries, meetingID: meetingID, persist: true)
+    }
+
+    private func translateEntries(_ entries: [TranscriptEntry], meetingID: Meeting.ID, persist: Bool) {
+        let pendingEntries = entriesNeedingTranslation(entries)
+            .filter { !translationEntryIDsInFlight.contains($0.id) }
+        guard !pendingEntries.isEmpty else { return }
+        pendingEntries.forEach { translationEntryIDsInFlight.insert($0.id) }
+
+        if let index = meetings.firstIndex(where: { $0.id == meetingID }), meetings[index].status == .live {
+            meetings[index].subtitle = "正在录音 · 外语片段翻译中"
+        }
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let translations = try await openAISummary.translateToChinese(entries: pendingEntries)
+                applyTranslations(translations, meetingID: meetingID)
+                pendingEntries.forEach { translationEntryIDsInFlight.remove($0.id) }
+                if persist, let meeting = meetings.first(where: { $0.id == meetingID }) {
+                    persistMeetingSnapshot(meeting)
+                }
+            } catch {
+                pendingEntries.forEach { translationEntryIDsInFlight.remove($0.id) }
+                lastErrorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func entriesNeedingTranslation(_ entries: [TranscriptEntry]) -> [TranscriptEntry] {
+        entries.filter { entry in
+            let original = entry.original.trimmingCharacters(in: .whitespacesAndNewlines)
+            let translation = entry.translation.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !original.isEmpty else { return false }
+            let alreadyChinese = !translation.isEmpty && !Self.textLooksEnglish(translation)
+            if alreadyChinese && translation != original {
+                return false
+            }
+            return entry.sourceLanguage != "中文" || Self.textLooksEnglish(original)
+        }
+    }
+
+    private func applyTranslations(_ translations: [TranscriptEntry.ID: String], meetingID: Meeting.ID) {
+        guard !translations.isEmpty else { return }
+        var entries = transcriptByMeeting[meetingID, default: []]
+        applyTranslations(translations, to: &entries)
+        transcriptByMeeting[meetingID] = entries
+
+        applyTranslations(translations, to: &qwenLiveEntriesByMeeting)
+        applyTranslations(translations, to: &whisperLiveEntriesByMeeting)
+        applyTranslations(translations, to: &liveSpeakerEntriesByMeeting)
+
+        if let draft = liveStreamingEntryByMeeting[meetingID],
+           let translation = translations[draft.id] {
+            var updatedDraft = draft
+            updatedDraft.translation = translation
+            liveStreamingEntryByMeeting[meetingID] = updatedDraft
+        }
+
+        if let index = meetings.firstIndex(where: { $0.id == meetingID }), meetings[index].status == .live {
+            meetings[index].subtitle = "正在录音 · 外语片段已翻译"
+        }
+    }
+
+    private func applyTranslations(_ translations: [TranscriptEntry.ID: String], to entries: inout [TranscriptEntry]) {
+        for index in entries.indices {
+            guard let translation = translations[entries[index].id]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !translation.isEmpty else { continue }
+            entries[index].translation = translation
+        }
+    }
+
+    private func applyTranslations(
+        _ translations: [TranscriptEntry.ID: String],
+        to groupedEntries: inout [Meeting.ID: [UUID: [TranscriptEntry]]]
+    ) {
+        for meetingID in Array(groupedEntries.keys) {
+            var commandEntries = groupedEntries[meetingID, default: [:]]
+            for commandID in Array(commandEntries.keys) {
+                var entries = commandEntries[commandID, default: []]
+                applyTranslations(translations, to: &entries)
+                commandEntries[commandID] = entries
+            }
+            groupedEntries[meetingID] = commandEntries
         }
     }
 

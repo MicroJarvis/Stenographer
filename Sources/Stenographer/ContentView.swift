@@ -911,6 +911,13 @@ struct EnginePanel: View {
                 Label("分析声纹", systemImage: "person.wave.2")
             }
             .disabled(!store.canAnalyzeSpeakersSelectedMeeting)
+
+            Button {
+                store.translateSelectedMeeting()
+            } label: {
+                Label("翻译当前会议", systemImage: "character.book.closed")
+            }
+            .disabled(!store.canTranslateSelectedMeeting)
         }
     }
 }

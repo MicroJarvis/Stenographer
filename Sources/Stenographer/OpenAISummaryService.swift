@@ -157,14 +157,94 @@ final class OpenAISummaryService: ObservableObject {
         }
     }
 
+    func translateToChinese(entries: [TranscriptEntry]) async throws -> [UUID: String] {
+        saveSettings()
+        guard isConfigured else {
+            throw OpenAISummaryError.notConfigured
+        }
+        guard !entries.isEmpty else { return [:] }
+        let endpoints = summaryEndpointCandidates()
+        guard !endpoints.isEmpty else {
+            throw OpenAISummaryError.invalidBaseURL
+        }
+
+        isRunning = true
+        statusText = "OpenAI 翻译中"
+        defer { isRunning = false }
+
+        var translations: [UUID: String] = [:]
+        do {
+            for batch in Self.translationBatches(from: entries) {
+                let prompt = Self.translationPrompt(entries: batch)
+                var lastHTTPError: OpenAISummaryHTTPError?
+                var translatedBatch: [UUID: String]?
+
+                for endpoint in endpoints {
+                    do {
+                        let content = try await sendTranslationRequest(endpoint: endpoint, prompt: prompt)
+                        translatedBatch = try Self.translationMap(from: content)
+                        break
+                    } catch let error as OpenAISummaryHTTPError {
+                        lastHTTPError = error
+                        if shouldTryNextEndpoint(after: error, current: endpoint, endpoints: endpoints) {
+                            continue
+                        }
+                        throw Self.summaryError(from: error)
+                    }
+                }
+
+                if let translatedBatch {
+                    translations.merge(translatedBatch) { _, newValue in newValue }
+                } else if let lastHTTPError {
+                    throw Self.summaryError(from: lastHTTPError)
+                } else {
+                    throw OpenAISummaryError.emptyResponse
+                }
+            }
+            statusText = translations.isEmpty ? "无可翻译内容" : "已翻译"
+            return translations
+        } catch let error as OpenAISummaryError {
+            statusText = "翻译失败"
+            throw error
+        } catch {
+            statusText = "翻译失败"
+            throw OpenAISummaryError.requestFailed(error.localizedDescription)
+        }
+    }
+
     private func sendSummaryRequest(endpoint: OpenAISummaryEndpoint, prompt: String) async throws -> String {
+        try await sendJSONRequest(
+            endpoint: endpoint,
+            prompt: prompt,
+            instructions: "你是一个严谨的中文会议纪要助手。只输出合法 JSON，不要输出 Markdown。",
+            statusPrefix: "OpenAI 整理中"
+        )
+    }
+
+    private func sendTranslationRequest(endpoint: OpenAISummaryEndpoint, prompt: String) async throws -> String {
+        try await sendJSONRequest(
+            endpoint: endpoint,
+            prompt: prompt,
+            instructions: "你是一个专业会议同传译员。只输出合法 JSON，不要输出 Markdown。",
+            statusPrefix: "OpenAI 翻译中"
+        )
+    }
+
+    private func sendJSONRequest(
+        endpoint: OpenAISummaryEndpoint,
+        prompt: String,
+        instructions: String,
+        statusPrefix: String
+    ) async throws -> String {
         var request = URLRequest(url: endpoint.url)
         request.httpMethod = "POST"
         request.timeoutInterval = 90
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(apiKeyDraft)", forHTTPHeaderField: "Authorization")
-        request.httpBody = try JSONSerialization.data(withJSONObject: requestBody(endpoint: endpoint, prompt: prompt))
-        statusText = "OpenAI 整理中 · \(endpoint.label)"
+        request.httpBody = try JSONSerialization.data(
+            withJSONObject: requestBody(endpoint: endpoint, prompt: prompt, instructions: instructions)
+        )
+        statusText = "\(statusPrefix) · \(endpoint.label)"
 
         let (data, response) = try await URLSession.shared.data(for: request)
         let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -181,12 +261,12 @@ final class OpenAISummaryService: ObservableObject {
         }
     }
 
-    private func requestBody(endpoint: OpenAISummaryEndpoint, prompt: String) -> [String: Any] {
+    private func requestBody(endpoint: OpenAISummaryEndpoint, prompt: String, instructions: String) -> [String: Any] {
         switch endpoint {
         case .responses:
             return [
                 "model": modelName,
-                "instructions": "你是一个严谨的中文会议纪要助手。只输出合法 JSON，不要输出 Markdown。",
+                "instructions": instructions,
                 "input": prompt,
                 "text": [
                     "format": [
@@ -200,7 +280,7 @@ final class OpenAISummaryService: ObservableObject {
                 "messages": [
                     [
                         "role": "system",
-                        "content": "你是一个严谨的中文会议纪要助手。只输出合法 JSON，不要输出 Markdown。"
+                        "content": instructions
                     ],
                     [
                         "role": "user",
@@ -307,6 +387,87 @@ final class OpenAISummaryService: ObservableObject {
         会议转写：
         \(transcript)
         """
+    }
+
+    private static func translationBatches(from entries: [TranscriptEntry]) -> [[TranscriptEntry]] {
+        var batches: [[TranscriptEntry]] = []
+        var current: [TranscriptEntry] = []
+        var currentLength = 0
+        let maxBatchCount = 20
+        let maxBatchLength = 6_000
+
+        for entry in entries {
+            let textLength = entry.original.count
+            if !current.isEmpty,
+               (current.count >= maxBatchCount || currentLength + textLength > maxBatchLength) {
+                batches.append(current)
+                current = []
+                currentLength = 0
+            }
+            current.append(entry)
+            currentLength += textLength
+        }
+
+        if !current.isEmpty {
+            batches.append(current)
+        }
+        return batches
+    }
+
+    private static func translationPrompt(entries: [TranscriptEntry]) -> String {
+        let items: [[String: String]] = entries.map { entry in
+            [
+                "id": entry.id.uuidString,
+                "time": entry.time,
+                "sourceLanguage": entry.sourceLanguage,
+                "text": entry.original
+            ]
+        }
+        let data = (try? JSONSerialization.data(withJSONObject: items, options: [.sortedKeys]))
+            ?? Data("[]".utf8)
+        let json = String(data: data, encoding: .utf8) ?? "[]"
+        return """
+        请把下面会议转写逐条翻译成自然、准确、可读的中文。
+
+        要求：
+        1. 只翻译 text，不要补充原文没有的信息。
+        2. 保留人名、产品名、医学/牙科/软件术语；必要时用中文解释术语含义。
+        3. 如果原文已经是中文，直接返回原文。
+        4. 输出严格 JSON，格式为：
+        {"translations":[{"id":"原 id","translation":"中文翻译"}]}
+
+        待翻译条目：
+        \(json)
+        """
+    }
+
+    private static func translationMap(from content: String) throws -> [UUID: String] {
+        let jsonText = extractJSONObject(from: content) ?? content
+        guard let data = jsonText.data(using: .utf8),
+              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw OpenAISummaryError.emptyResponse
+        }
+
+        if let translations = object["translations"] as? [[String: Any]] {
+            let pairs: [(UUID, String)] = translations.compactMap { item in
+                guard let idText = item["id"] as? String,
+                      let id = UUID(uuidString: idText),
+                      let translation = (item["translation"] as? String)?.nilIfBlank else { return nil }
+                return (id, translation)
+            }
+            return Dictionary(uniqueKeysWithValues: pairs)
+        }
+
+        var result: [UUID: String] = [:]
+        for (key, value) in object {
+            guard let id = UUID(uuidString: key),
+                  let translation = (value as? String)?.nilIfBlank else { continue }
+            result[id] = translation
+        }
+        if result.isEmpty {
+            throw OpenAISummaryError.emptyResponse
+        }
+        return result
     }
 
     private static func messageContent(from data: Data) throws -> String {
