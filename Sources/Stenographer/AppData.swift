@@ -74,11 +74,14 @@ struct Speaker: Identifiable, Hashable {
     var confidence: String
 
     var isUnnamed: Bool {
-        name == "未命名声纹"
+        name.isUnnamedVoiceName
     }
 
     var displayName: String {
-        isUnnamed ? "\(name) \(voiceprint)" : name
+        if name.placeholderSpeakerNumber != nil {
+            return name
+        }
+        return isUnnamed ? "\(name) \(voiceprint)" : name
     }
 }
 
@@ -129,6 +132,7 @@ final class MeetingStore: ObservableObject {
     private var liveSpeakerEntriesByMeeting: [Meeting.ID: [UUID: [TranscriptEntry]]] = [:]
     private var speakerEmbeddingByID: [Speaker.ID: [Double]] = [:]
     private var rememberedVoiceprintIDs = Set<Speaker.ID>()
+    private var placeholderSpeakerIDsByMeeting: [Meeting.ID: Speaker.ID] = [:]
     private let speakerTrackManager = SpeakerTrackManager()
 
     init(seed: SampleSeed = .default) {
@@ -308,10 +312,14 @@ final class MeetingStore: ObservableObject {
         qwenLiveEntriesByMeeting[newMeeting.id] = [:]
         whisperLiveEntriesByMeeting[newMeeting.id] = [:]
         liveSpeakerEntriesByMeeting[newMeeting.id] = [:]
+        placeholderSpeakerIDsByMeeting[newMeeting.id] = nil
+        let defaultSpeaker = ensurePlaceholderSpeaker(for: newMeeting.id, index: 1)
+        placeholderSpeakerIDsByMeeting[newMeeting.id] = defaultSpeaker.id
         speakerTrackManager.reset(
             rememberedSpeakers: speakers.filter { rememberedVoiceprintIDs.contains($0.id) },
             embeddingsByID: speakerEmbeddingByID
         )
+        speakerTrackManager.reserveTemporarySpeaker(defaultSpeaker)
         lastErrorMessage = nil
         lastLiveTranscriptionSecond = 0
         qwenRefiner.reset()
@@ -435,7 +443,7 @@ final class MeetingStore: ObservableObject {
             guard let self else { return }
             do {
                 let entries = try await nanoGGUF.transcribe(audioPath: audioPath, outputPath: outputPath)
-                transcriptByMeeting[selectedMeetingID] = normalizeTranscript(entries)
+                transcriptByMeeting[selectedMeetingID] = normalizeTranscript(entries, meetingID: selectedMeetingID)
                 updateSelectedMeeting { meeting in
                     meeting.speakerCount = max(1, Set(transcriptByMeeting[selectedMeetingID, default: []].map(\.speakerID)).count)
                     if meeting.status == .draft {
@@ -564,6 +572,54 @@ final class MeetingStore: ObservableObject {
         )
     }
 
+    @discardableResult
+    private func ensurePlaceholderSpeaker(for meetingID: Meeting.ID, index: Int = 1) -> Speaker {
+        if let speakerID = placeholderSpeakerIDsByMeeting[meetingID],
+           let speaker = speakers.first(where: { $0.id == speakerID }) {
+            return speaker
+        }
+
+        let name = "说话人\(index)"
+        let currentSpeakerIDs = meetingSpeakerIDs(for: meetingID)
+        if let speaker = speakers.first(where: { currentSpeakerIDs.contains($0.id) && $0.name == name }) {
+            placeholderSpeakerIDsByMeeting[meetingID] = speaker.id
+            return speaker
+        }
+
+        let speakerID = UUID()
+        let speaker = Speaker(
+            id: speakerID,
+            name: name,
+            voiceprint: "TEMP-\(index)",
+            role: "实时临时声纹",
+            tint: speakerTint(for: speakerID),
+            confidence: "--"
+        )
+        speakers.append(speaker)
+        placeholderSpeakerIDsByMeeting[meetingID] = speakerID
+        return speaker
+    }
+
+    private func fallbackSpeakerID(for meetingID: Meeting.ID?) -> Speaker.ID {
+        if let meetingID {
+            return ensurePlaceholderSpeaker(for: meetingID).id
+        }
+        if let speaker = speakers.first(where: { $0.name.placeholderSpeakerNumber == 1 }) {
+            return speaker.id
+        }
+        let speakerID = UUID()
+        let speaker = Speaker(
+            id: speakerID,
+            name: "说话人1",
+            voiceprint: "TEMP-1",
+            role: "实时临时声纹",
+            tint: speakerTint(for: speakerID),
+            confidence: "--"
+        )
+        speakers.append(speaker)
+        return speakerID
+    }
+
     func engineItems() -> [EngineItem] {
         return [
             EngineItem(name: "录音", detail: selectedMeetingAudioPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "等待创建音频文件", status: recorder.currentMeetingID == selectedMeetingID ? "写入中" : "就绪", tint: recorder.currentMeetingID == selectedMeetingID ? .red : .green),
@@ -626,7 +682,7 @@ final class MeetingStore: ObservableObject {
                 let whisperPCMHandler = try whisperLarge.startLiveTranscription(
                     meetingDirectoryPath: directoryURL.path,
                     language: preferredLanguage,
-                    defaultSpeakerID: speakers[0].id,
+                    defaultSpeakerID: fallbackSpeakerID(for: meetingID),
                     onUpdate: { [weak self] update in
                         self?.applyWhisperLiveTranscription(update, meetingID: meetingID)
                     },
@@ -675,7 +731,7 @@ final class MeetingStore: ObservableObject {
             time: selectedMeeting?.duration ?? "00:00:00",
             startMS: selectedMeeting.map { $0.durationSeconds * 1000 },
             endMS: selectedMeeting.map { $0.durationSeconds * 1000 },
-            speakerID: speakers[0].id,
+            speakerID: fallbackSpeakerID(for: selectedMeetingID),
             sourceLanguage: "中文",
             original: text,
             translation: text,
@@ -685,7 +741,7 @@ final class MeetingStore: ObservableObject {
     }
 
     private func applyQwenLiveRefinement(_ update: QwenLiveRefinementUpdate, meetingID: Meeting.ID) {
-        let normalizedEntries = normalizeTranscript(update.entries)
+        let normalizedEntries = normalizeTranscript(update.entries, meetingID: meetingID)
         guard !normalizedEntries.isEmpty else { return }
 
         qwenLiveEntriesByMeeting[meetingID, default: [:]][update.commandID] = normalizedEntries
@@ -701,7 +757,7 @@ final class MeetingStore: ObservableObject {
     }
 
     private func applyWhisperLiveTranscription(_ update: WhisperLiveTranscriptionUpdate, meetingID: Meeting.ID) {
-        let normalizedEntries = normalizeTranscript(update.entries)
+        let normalizedEntries = normalizeTranscript(update.entries, meetingID: meetingID)
         guard !normalizedEntries.isEmpty else { return }
 
         whisperLiveEntriesByMeeting[meetingID, default: [:]][update.commandID] = normalizedEntries
@@ -724,9 +780,10 @@ final class MeetingStore: ObservableObject {
             upsertSpeaker(from: recognized)
         }
 
-        let entries = normalizeTranscript(reconciled.transcript)
+        let entries = normalizeTranscript(reconciled.transcript, meetingID: meetingID)
         guard !entries.isEmpty else { return }
 
+        updateLiveDraftSpeaker(for: meetingID, using: entries)
         liveSpeakerEntriesByMeeting[meetingID, default: [:]][update.commandID] = entries
         rebuildLiveTranscript(for: meetingID)
 
@@ -747,6 +804,17 @@ final class MeetingStore: ObservableObject {
 
     private func reconcileLiveSpeakerResult(_ result: SpeakerDiarizationResult, meetingID: Meeting.ID) -> SpeakerDiarizationResult {
         reconcileSpeakerResult(result)
+    }
+
+    private func updateLiveDraftSpeaker(for meetingID: Meeting.ID, using entries: [TranscriptEntry]) {
+        guard var draft = liveStreamingEntryByMeeting[meetingID],
+              let latest = entries.max(by: {
+                  ($0.endMS ?? $0.startMS ?? Self.milliseconds(from: $0.time))
+                    < ($1.endMS ?? $1.startMS ?? Self.milliseconds(from: $1.time))
+              }) else { return }
+        draft.speakerID = latest.speakerID
+        liveStreamingEntryByMeeting[meetingID] = draft
+        placeholderSpeakerIDsByMeeting[meetingID] = latest.speakerID
     }
 
     private func mergeEmbedding(_ embedding: [Double], into speakerID: Speaker.ID) {
@@ -773,13 +841,13 @@ final class MeetingStore: ObservableObject {
 
         var enhancedEntries: [TranscriptEntry] = []
         if !qwenEntries.isEmpty {
-            let qwenNormalized = normalizeTranscript(qwenEntries)
+            let qwenNormalized = normalizeTranscript(qwenEntries, meetingID: meetingID)
             enhancedEntries = mergeWhisperGapEntries(
-                normalizeTranscript(whisperEntries),
+                normalizeTranscript(whisperEntries, meetingID: meetingID),
                 into: qwenNormalized
             )
         } else if !whisperEntries.isEmpty {
-            enhancedEntries = normalizeTranscript(whisperEntries)
+            enhancedEntries = normalizeTranscript(whisperEntries, meetingID: meetingID)
         }
 
         let entries: [TranscriptEntry]
@@ -789,11 +857,11 @@ final class MeetingStore: ObservableObject {
                 using: speakerSegments(from: speakerEntries)
             )
         } else if !speakerEntries.isEmpty {
-            entries = normalizeTranscript(speakerEntries)
+            entries = normalizeTranscript(speakerEntries, meetingID: meetingID)
         } else {
             entries = []
         }
-        transcriptByMeeting[meetingID] = normalizeTranscript(entries)
+        transcriptByMeeting[meetingID] = normalizeTranscript(entries, meetingID: meetingID)
     }
 
     private func speakerSegments(from entries: [TranscriptEntry]) -> [SpeakerDiarizationSegment] {
@@ -868,7 +936,7 @@ final class MeetingStore: ObservableObject {
 
         do {
             let entries = try await transcriber.transcribe(audioPath: audioPath, outputPath: transcriptPath)
-            transcriptByMeeting[selectedMeetingID] = normalizeTranscript(entries)
+            transcriptByMeeting[selectedMeetingID] = normalizeTranscript(entries, meetingID: selectedMeetingID)
             updateSelectedMeeting { meeting in
                 meeting.speakerCount = max(1, Set(transcriptByMeeting[selectedMeetingID, default: []].map(\.speakerID)).count)
                 if isLive && meeting.status == .live {
@@ -881,11 +949,11 @@ final class MeetingStore: ObservableObject {
         }
     }
 
-    private func normalizeTranscript(_ entries: [TranscriptEntry]) -> [TranscriptEntry] {
+    private func normalizeTranscript(_ entries: [TranscriptEntry], meetingID: Meeting.ID? = nil) -> [TranscriptEntry] {
         entries.map { entry in
             var normalized = entry
             if !speakers.contains(where: { $0.id == normalized.speakerID }) {
-                normalized.speakerID = speakers[0].id
+                normalized.speakerID = fallbackSpeakerID(for: meetingID)
             }
             return normalized
         }
@@ -925,7 +993,7 @@ final class MeetingStore: ObservableObject {
         }
 
         let existingEntries = transcriptByMeeting[meetingID, default: []]
-        let diarizedEntries = normalizeTranscript(reconciled.transcript)
+        let diarizedEntries = normalizeTranscript(reconciled.transcript, meetingID: meetingID)
         let detectedSpeakerCount = [
             reconciled.speakers.count,
             Set(reconciled.segments.map(\.speakerID)).count,
@@ -1250,7 +1318,19 @@ private final class PCMChunkFanout: @unchecked Sendable {
 private extension String {
     var isUnnamedVoiceName: Bool {
         let normalized = trimmingCharacters(in: .whitespacesAndNewlines)
-        return normalized.isEmpty || normalized == "未命名声纹" || normalized.hasPrefix("未命名声纹 ")
+        return normalized.isEmpty
+            || normalized == "未命名声纹"
+            || normalized.hasPrefix("未命名声纹 ")
+            || placeholderSpeakerNumber != nil
+    }
+
+    var placeholderSpeakerNumber: Int? {
+        let normalized = trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = "说话人"
+        guard normalized.hasPrefix(prefix) else { return nil }
+        let suffix = normalized.dropFirst(prefix.count)
+        guard !suffix.isEmpty, suffix.allSatisfy({ $0.isNumber }) else { return nil }
+        return Int(suffix)
     }
 }
 

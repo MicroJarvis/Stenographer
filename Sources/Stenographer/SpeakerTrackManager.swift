@@ -28,9 +28,13 @@ final class SpeakerTrackManager {
     private let ambiguousMargin = 0.05
     private let promotionHitCount = 2
     private var tracks: [UUID: Track] = [:]
+    private var nextPlaceholderIndex = 1
+    private var reservedTemporaryTrackIDsByName: [String: UUID] = [:]
 
     func reset(rememberedSpeakers: [Speaker], embeddingsByID: [UUID: [Double]]) {
         tracks.removeAll()
+        nextPlaceholderIndex = 1
+        reservedTemporaryTrackIDsByName.removeAll()
         for speaker in rememberedSpeakers {
             guard let embedding = embeddingsByID[speaker.id], !embedding.isEmpty else { continue }
             tracks[speaker.id] = Track(
@@ -45,6 +49,11 @@ final class SpeakerTrackManager {
                 isRemembered: true
             )
         }
+    }
+
+    func reserveTemporarySpeaker(_ speaker: Speaker) {
+        guard Self.isPlaceholderSpeakerName(speaker.name) else { return }
+        reservedTemporaryTrackIDsByName[speaker.name] = speaker.id
     }
 
     func remember(speaker: Speaker, embedding: [Double]) {
@@ -183,11 +192,13 @@ final class SpeakerTrackManager {
             )
         }
 
-        let trackID = recognized.id == Self.zeroUUID ? UUID() : recognized.id
         let role = stats.durationMS < 1_500 ? "短片段待确认" : "临时声纹"
+        let name = Self.isUnnamedVoiceName(recognized.name) ? nextPlaceholderName() : recognized.name
+        let trackID = reservedTemporaryTrackIDsByName.removeValue(forKey: name)
+            ?? (recognized.id == Self.zeroUUID ? UUID() : recognized.id)
         let track = Track(
             id: trackID,
-            name: recognized.name.isEmpty ? "未命名声纹" : recognized.name,
+            name: name,
             voiceprint: recognized.voiceprint.isEmpty ? "VP-CAM" : recognized.voiceprint,
             role: role,
             confidence: "--",
@@ -223,6 +234,11 @@ final class SpeakerTrackManager {
             return true
         }
         return stats.durationMS >= 2_500 && match.margin >= ambiguousMargin
+    }
+
+    private func nextPlaceholderName() -> String {
+        defer { nextPlaceholderIndex += 1 }
+        return "说话人\(nextPlaceholderIndex)"
     }
 
     private func bestMatch(for embedding: [Double]) -> Match? {
@@ -295,6 +311,22 @@ final class SpeakerTrackManager {
 
     private static func percent(_ score: Double) -> String {
         "\(max(0, min(99, Int(round(score * 100)))))%"
+    }
+
+    private static func isUnnamedVoiceName(_ name: String) -> Bool {
+        let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty
+            || normalized == "未命名声纹"
+            || normalized.hasPrefix("未命名声纹 ")
+            || isPlaceholderSpeakerName(normalized)
+    }
+
+    private static func isPlaceholderSpeakerName(_ name: String) -> Bool {
+        let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = "说话人"
+        guard normalized.hasPrefix(prefix) else { return false }
+        let suffix = normalized.dropFirst(prefix.count)
+        return !suffix.isEmpty && suffix.allSatisfy { $0.isNumber }
     }
 
     private static let zeroUUID = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!

@@ -58,6 +58,7 @@ final class SpeakerDiarizationService: ObservableObject {
 
     let modelName = "FunASR CAM++"
     private let liveWindowSeconds = 24
+    private let liveFirstWindowSeconds = 8
     private let liveHopSeconds = 8
     private var liveWorker: Process?
     private var liveInputPipe: Pipe?
@@ -148,6 +149,7 @@ final class SpeakerDiarizationService: ObservableObject {
             directoryURL: URL(fileURLWithPath: meetingDirectoryPath, isDirectory: true)
                 .appendingPathComponent("speaker_live_segments", isDirectory: true),
             windowSeconds: liveWindowSeconds,
+            firstWindowSeconds: liveFirstWindowSeconds,
             hopSeconds: liveHopSeconds,
             onSegment: { [weak self] segment in
                 Task { @MainActor in
@@ -295,7 +297,7 @@ final class SpeakerDiarizationService: ObservableObject {
 
         switch type {
         case "ready":
-            statusText = "等待声纹窗口"
+            statusText = "收集首个声纹片段"
         case "result":
             guard let idString = event["id"] as? String,
                   let commandID = UUID(uuidString: idString),
@@ -374,12 +376,13 @@ private struct LiveSpeakerAudioSegment: Sendable {
 private final class LiveSpeakerAudioSegmenter: @unchecked Sendable {
     private let directoryURL: URL
     private let windowFrameCount: Int
+    private let firstWindowFrameCount: Int
     private let hopFrameCount: Int
     private let onSegment: @Sendable (LiveSpeakerAudioSegment) -> Void
     private let onFinished: @Sendable () -> Void
     private let queue = DispatchQueue(label: "Stenographer.LiveSpeakerAudioSegmenter")
     private var samples: [Float] = []
-    private var nextEmitSampleCount: Int
+    private var nextEmitSampleCount = 0
     private var totalSampleCount = 0
     private var emittedWindowCount = 0
     private var isFinished = false
@@ -387,14 +390,16 @@ private final class LiveSpeakerAudioSegmenter: @unchecked Sendable {
     init(
         directoryURL: URL,
         windowSeconds: Int,
+        firstWindowSeconds: Int,
         hopSeconds: Int,
         onSegment: @escaping @Sendable (LiveSpeakerAudioSegment) -> Void,
         onFinished: @escaping @Sendable () -> Void
     ) {
         self.directoryURL = directoryURL
         self.windowFrameCount = max(1, windowSeconds) * 16_000
+        self.firstWindowFrameCount = max(1, min(firstWindowSeconds, windowSeconds)) * 16_000
         self.hopFrameCount = max(1, hopSeconds) * 16_000
-        self.nextEmitSampleCount = self.windowFrameCount
+        self.nextEmitSampleCount = self.firstWindowFrameCount
         self.onSegment = onSegment
         self.onFinished = onFinished
         samples.reserveCapacity(self.windowFrameCount + self.hopFrameCount)
