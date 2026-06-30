@@ -11,6 +11,7 @@ final class SpeakerTrackManager {
         var hitCount: Int
         var lastSeenMS: Int
         var isRemembered: Bool
+        var seenInCurrentMeeting: Bool
     }
 
     private struct Match {
@@ -24,8 +25,15 @@ final class SpeakerTrackManager {
     }
 
     private let confirmedThreshold = 0.80
-    private let tentativeThreshold = 0.68
     private let ambiguousMargin = 0.05
+    private let meetingTrackThreshold = 0.74
+    private let meetingTrackStrongThreshold = 0.78
+    private let meetingTrackSameWindowThreshold = 0.82
+    private let meetingTrackShortSegmentThreshold = 0.80
+    private let meetingTrackAmbiguousMargin = 0.02
+    private let rememberedStrongThreshold = 0.84
+    private let softMeetingSpeakerLimit = 6
+    private let softMeetingMergeThreshold = 0.68
     private let promotionHitCount = 2
     private var tracks: [UUID: Track] = [:]
     private var nextPlaceholderIndex = 1
@@ -46,7 +54,8 @@ final class SpeakerTrackManager {
                 centroid: embedding,
                 hitCount: promotionHitCount,
                 lastSeenMS: 0,
-                isRemembered: true
+                isRemembered: true,
+                seenInCurrentMeeting: false
             )
         }
     }
@@ -58,6 +67,7 @@ final class SpeakerTrackManager {
 
     func remember(speaker: Speaker, embedding: [Double]) {
         guard !embedding.isEmpty else { return }
+        let existing = tracks[speaker.id]
         tracks[speaker.id] = Track(
             id: speaker.id,
             name: speaker.name,
@@ -65,9 +75,10 @@ final class SpeakerTrackManager {
             role: speaker.role,
             confidence: speaker.confidence,
             centroid: embedding,
-            hitCount: promotionHitCount,
-            lastSeenMS: tracks[speaker.id]?.lastSeenMS ?? 0,
-            isRemembered: true
+            hitCount: max(existing?.hitCount ?? 0, promotionHitCount),
+            lastSeenMS: existing?.lastSeenMS ?? 0,
+            isRemembered: true,
+            seenInCurrentMeeting: existing?.seenInCurrentMeeting ?? false
         )
     }
 
@@ -85,6 +96,7 @@ final class SpeakerTrackManager {
             target.hitCount = max(target.hitCount, source.hitCount)
             target.lastSeenMS = max(target.lastSeenMS, source.lastSeenMS)
             target.isRemembered = target.isRemembered || source.isRemembered
+            target.seenInCurrentMeeting = target.seenInCurrentMeeting || source.seenInCurrentMeeting
         }
         tracks[targetID] = target
         tracks.removeValue(forKey: sourceID)
@@ -93,9 +105,11 @@ final class SpeakerTrackManager {
     func reconcile(
         _ result: SpeakerDiarizationResult,
         knownSpeakers: [Speaker],
-        rememberedSpeakerIDs: Set<UUID>
+        rememberedSpeakerIDs: Set<UUID>,
+        meetingSpeakerIDs: Set<UUID>
     ) -> SpeakerDiarizationResult {
         syncKnownSpeakerNames(knownSpeakers, rememberedSpeakerIDs: rememberedSpeakerIDs)
+        markSeenInCurrentMeeting(meetingSpeakerIDs)
 
         let segmentStats = statsBySourceSpeaker(result.segments)
         var idMap: [UUID: UUID] = [:]
@@ -169,33 +183,28 @@ final class SpeakerTrackManager {
             )
         }
 
-        if let match = bestMatch(for: recognized.embedding),
-           shouldUse(match, stats: stats, assignedThisWindow: assignedThisWindow),
-           var track = tracks[match.trackID] {
-            let newWeight = track.isRemembered ? 0.18 : 0.35
-            track.centroid = Self.blend(old: track.centroid, new: recognized.embedding, newWeight: newWeight)
-            track.hitCount += 1
-            track.lastSeenMS = max(track.lastSeenMS, stats.lastSeenMS)
-            if !track.isRemembered && track.hitCount >= promotionHitCount {
-                track.role = "临时稳定声纹"
-            }
-            track.confidence = Self.percent(match.score)
-            tracks[track.id] = track
-            return Assignment(
-                id: track.id,
-                name: track.name,
-                voiceprint: track.voiceprint,
-                role: track.role,
-                confidence: track.confidence,
-                embedding: track.centroid,
-                similarity: match.score
-            )
+        if let meetingMatch = bestMatch(for: recognized.embedding, include: { isMeetingTrack($0) }),
+           shouldUseMeetingTrack(meetingMatch, stats: stats, assignedThisWindow: assignedThisWindow),
+           let assignment = updateTrack(meetingMatch.trackID, with: recognized, stats: stats, similarity: meetingMatch.score) {
+            return assignment
+        }
+
+        if let rememberedMatch = bestMatch(for: recognized.embedding, include: { !$0.seenInCurrentMeeting && $0.isRemembered }),
+           shouldUseRememberedTrack(rememberedMatch, stats: stats, assignedThisWindow: assignedThisWindow),
+           let assignment = updateTrack(rememberedMatch.trackID, with: recognized, stats: stats, similarity: rememberedMatch.score) {
+            return assignment
+        }
+
+        if let meetingMatch = bestMatch(for: recognized.embedding, include: { isMeetingTrack($0) }),
+           shouldMergeBecauseMeetingIsCrowded(meetingMatch, stats: stats, assignedThisWindow: assignedThisWindow),
+           let assignment = updateTrack(meetingMatch.trackID, with: recognized, stats: stats, similarity: meetingMatch.score) {
+            return assignment
         }
 
         let role = stats.durationMS < 1_500 ? "短片段待确认" : "临时声纹"
-        let name = Self.isUnnamedVoiceName(recognized.name) ? nextPlaceholderName() : recognized.name
+        let name = shouldUseNameForNewTrack(recognized) ? recognized.name : nextPlaceholderName()
         let trackID = reservedTemporaryTrackIDsByName.removeValue(forKey: name)
-            ?? (recognized.id == Self.zeroUUID ? UUID() : recognized.id)
+            ?? reusableID(from: recognized)
         let track = Track(
             id: trackID,
             name: name,
@@ -205,7 +214,8 @@ final class SpeakerTrackManager {
             centroid: recognized.embedding,
             hitCount: 1,
             lastSeenMS: stats.lastSeenMS,
-            isRemembered: false
+            isRemembered: false,
+            seenInCurrentMeeting: true
         )
         tracks[trackID] = track
         return Assignment(
@@ -219,21 +229,81 @@ final class SpeakerTrackManager {
         )
     }
 
-    private func shouldUse(_ match: Match, stats: SegmentStats, assignedThisWindow: Set<UUID>) -> Bool {
-        if match.score >= confirmedThreshold && match.margin >= ambiguousMargin {
+    private func updateTrack(
+        _ trackID: UUID,
+        with recognized: RecognizedSpeaker,
+        stats: SegmentStats,
+        similarity: Double
+    ) -> Assignment? {
+        guard var track = tracks[trackID] else { return nil }
+        let newWeight = track.isRemembered ? 0.18 : 0.35
+        track.centroid = Self.blend(old: track.centroid, new: recognized.embedding, newWeight: newWeight)
+        track.hitCount += 1
+        track.lastSeenMS = max(track.lastSeenMS, stats.lastSeenMS)
+        track.seenInCurrentMeeting = true
+        if !track.isRemembered && track.hitCount >= promotionHitCount {
+            track.role = "临时稳定声纹"
+        }
+        track.confidence = Self.percent(similarity)
+        tracks[track.id] = track
+        return Assignment(
+            id: track.id,
+            name: track.name,
+            voiceprint: track.voiceprint,
+            role: track.role,
+            confidence: track.confidence,
+            embedding: track.centroid,
+            similarity: similarity
+        )
+    }
+
+    private func shouldUseMeetingTrack(_ match: Match, stats: SegmentStats, assignedThisWindow: Set<UUID>) -> Bool {
+        guard let track = tracks[match.trackID], isMeetingTrack(track) else { return false }
+        if assignedThisWindow.contains(match.trackID) {
+            return match.score >= meetingTrackSameWindowThreshold
+        }
+        if stats.durationMS > 0 && stats.durationMS < 1_500 {
+            return match.score >= meetingTrackShortSegmentThreshold
+        }
+        if match.score >= meetingTrackStrongThreshold {
             return true
         }
-        guard match.score >= tentativeThreshold else { return false }
-        guard !assignedThisWindow.contains(match.trackID) else {
+        guard match.score >= meetingTrackThreshold else { return false }
+        if match.margin >= meetingTrackAmbiguousMargin {
+            return true
+        }
+        if !track.isRemembered && track.hitCount >= promotionHitCount && stats.durationMS >= 2_000 {
+            return true
+        }
+        return false
+    }
+
+    private func shouldUseRememberedTrack(_ match: Match, stats: SegmentStats, assignedThisWindow: Set<UUID>) -> Bool {
+        guard tracks[match.trackID]?.isRemembered == true else { return false }
+        if assignedThisWindow.contains(match.trackID) {
+            return match.score >= rememberedStrongThreshold
+        }
+        if match.score >= rememberedStrongThreshold {
+            return true
+        }
+        let hasCompetingTrack = match.secondScore > 0
+        return hasCompetingTrack
+            && stats.durationMS >= 2_500
+            && match.score >= confirmedThreshold
+            && match.margin >= ambiguousMargin
+    }
+
+    private func shouldMergeBecauseMeetingIsCrowded(
+        _ match: Match,
+        stats: SegmentStats,
+        assignedThisWindow: Set<UUID>
+    ) -> Bool {
+        guard meetingTrackCount >= softMeetingSpeakerLimit else { return false }
+        guard stats.durationMS >= 1_000 else { return false }
+        if assignedThisWindow.contains(match.trackID) {
             return match.score >= confirmedThreshold
         }
-        if let track = tracks[match.trackID],
-           !track.isRemembered,
-           track.hitCount >= 1,
-           (match.score >= 0.74 || match.margin >= 0.03) {
-            return true
-        }
-        return stats.durationMS >= 2_500 && match.margin >= ambiguousMargin
+        return match.score >= softMeetingMergeThreshold
     }
 
     private func nextPlaceholderName() -> String {
@@ -241,12 +311,36 @@ final class SpeakerTrackManager {
         return "说话人\(nextPlaceholderIndex)"
     }
 
-    private func bestMatch(for embedding: [Double]) -> Match? {
+    private func reusableID(from recognized: RecognizedSpeaker) -> UUID {
+        if recognized.id == Self.zeroUUID {
+            return UUID()
+        }
+        if tracks[recognized.id] != nil {
+            return UUID()
+        }
+        return recognized.id
+    }
+
+    private func shouldUseNameForNewTrack(_ recognized: RecognizedSpeaker) -> Bool {
+        guard !Self.isUnnamedVoiceName(recognized.name) else { return false }
+        return tracks[recognized.id] == nil
+    }
+
+    private var meetingTrackCount: Int {
+        tracks.values.filter { isMeetingTrack($0) }.count
+    }
+
+    private func isMeetingTrack(_ track: Track) -> Bool {
+        track.seenInCurrentMeeting || !track.isRemembered
+    }
+
+    private func bestMatch(for embedding: [Double], include: (Track) -> Bool) -> Match? {
         var bestID: UUID?
         var bestScore = -1.0
         var secondScore = -1.0
 
         for track in tracks.values {
+            guard include(track) else { continue }
             guard track.centroid.count == embedding.count else { continue }
             let score = Self.cosineSimilarity(embedding, track.centroid)
             if score > bestScore {
@@ -271,6 +365,15 @@ final class SpeakerTrackManager {
             track.confidence = speaker.confidence
             track.isRemembered = track.isRemembered || rememberedSpeakerIDs.contains(speaker.id)
             tracks[speaker.id] = track
+        }
+    }
+
+    private func markSeenInCurrentMeeting(_ speakerIDs: Set<UUID>) {
+        guard !speakerIDs.isEmpty else { return }
+        for speakerID in speakerIDs {
+            guard var track = tracks[speakerID] else { continue }
+            track.seenInCurrentMeeting = true
+            tracks[speakerID] = track
         }
     }
 

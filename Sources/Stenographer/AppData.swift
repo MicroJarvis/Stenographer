@@ -860,7 +860,7 @@ final class MeetingStore: ObservableObject {
     }
 
     private func reconcileLiveSpeakerResult(_ result: SpeakerDiarizationResult, meetingID: Meeting.ID) -> SpeakerDiarizationResult {
-        reconcileSpeakerResult(result)
+        reconcileSpeakerResult(result, meetingID: meetingID)
     }
 
     private func updateLiveDraftSpeaker(for meetingID: Meeting.ID, using entries: [TranscriptEntry]) {
@@ -1138,7 +1138,7 @@ final class MeetingStore: ObservableObject {
     }
 
     private func applySpeakerDiarization(_ result: SpeakerDiarizationResult, meetingID: Meeting.ID) {
-        let reconciled = reconcileSpeakerResult(result)
+        let reconciled = reconcileSpeakerResult(result, meetingID: meetingID)
 
         for recognized in reconciled.speakers {
             speakerEmbeddingByID[recognized.id] = recognized.embedding
@@ -1176,11 +1176,12 @@ final class MeetingStore: ObservableObject {
         }
     }
 
-    private func reconcileSpeakerResult(_ result: SpeakerDiarizationResult) -> SpeakerDiarizationResult {
+    private func reconcileSpeakerResult(_ result: SpeakerDiarizationResult, meetingID: Meeting.ID) -> SpeakerDiarizationResult {
         speakerTrackManager.reconcile(
             result,
             knownSpeakers: speakers,
-            rememberedSpeakerIDs: rememberedVoiceprintIDs
+            rememberedSpeakerIDs: rememberedVoiceprintIDs,
+            meetingSpeakerIDs: meetingSpeakerIDs(for: meetingID)
         )
     }
 
