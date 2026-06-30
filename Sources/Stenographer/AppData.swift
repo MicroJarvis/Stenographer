@@ -910,11 +910,16 @@ final class MeetingStore: ObservableObject {
                 meeting: meeting,
                 transcript: transcriptByMeeting[meeting.id, default: []],
                 summary: summaryByMeeting[meeting.id, default: []],
-                speakers: speakers
+                speakers: speakersForSnapshot(meetingID: meeting.id)
             )
         } catch {
             lastErrorMessage = error.localizedDescription
         }
+    }
+
+    private func speakersForSnapshot(meetingID: Meeting.ID) -> [Speaker] {
+        let includedIDs = meetingSpeakerIDs(for: meetingID)
+        return speakers.filter { includedIDs.contains($0.id) }
     }
 
     private func maybeStartLiveTranscription(force: Bool = false) {
