@@ -393,13 +393,21 @@ struct RecordingHeader: View {
 
                 Spacer()
 
-                VStack(alignment: .trailing, spacing: 4) {
+                VStack(alignment: .trailing, spacing: 8) {
                     Label(store.selectedMeeting?.status.rawValue ?? "空闲", systemImage: store.selectedMeeting?.status.systemImage ?? "circle")
                         .foregroundStyle(store.selectedMeeting?.status.tint ?? .secondary)
                         .font(.headline)
                     Text(store.selectedMeeting?.duration ?? "00:00:00")
                         .font(.system(.title2, design: .monospaced))
                         .foregroundStyle(.secondary)
+                    Button {
+                        store.translateSelectedMeeting()
+                    } label: {
+                        Label("翻译待处理", systemImage: "character.book.closed")
+                    }
+                    .controlSize(.small)
+                    .disabled(!store.canTranslateSelectedMeeting)
+                    .help(store.canTranslateSelectedMeeting ? "将待翻译外语片段翻译成中文" : "当前会议没有待翻译片段")
                 }
             }
 
