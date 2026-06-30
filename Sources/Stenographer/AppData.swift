@@ -408,13 +408,12 @@ final class MeetingStore: ObservableObject {
         updateSelectedMeeting { meeting in
             if meeting.status == .live || meeting.status == .paused {
                 meeting.status = .draft
-                meeting.subtitle = "刚刚结束 · Qwen3-ASR 收尾增强，Whisper large 补漏"
+                meeting.subtitle = "刚刚结束 · Qwen3-ASR 收尾增强"
             }
         }
         recorder.stopRecording()
         streamingTranscriber.finish()
         qwenRefiner.finishLiveEnhancement()
-        whisperLarge.finishLiveTranscription()
         speakerDiarizer.finishLiveDiarization()
         persistSelectedMeetingSnapshot()
         if let selectedMeetingID {
@@ -680,7 +679,6 @@ final class MeetingStore: ObservableObject {
             EngineItem(name: "FunASR ONNX", detail: "online paraformer 非量化优先", status: transcriptionStatusText, tint: streamingTranscriber.isRunning || transcriber.isRunning ? .blue : (selectedMeetingEntries.isEmpty ? .orange : .green)),
             EngineItem(name: "Fun-ASR-Nano GGUF", detail: nanoGGUF.modelDetail, status: nanoGGUF.statusText, tint: nanoGGUF.isRunning ? .blue : (nanoGGUF.isReady ? .green : .orange)),
             EngineItem(name: "Qwen3-ASR", detail: "正文主增强 · \(qwenRefiner.modelName)", status: qwenRefiner.statusText, tint: qwenRefiner.isRunning ? .blue : (selectedMeetingEntries.contains { $0.confidence.hasPrefix("qwen3-asr") } ? .green : .orange)),
-            EngineItem(name: "Whisper large", detail: "仅补漏 · \(whisperLarge.modelDetail)", status: whisperLarge.statusText, tint: whisperLarge.isRunning ? .blue : (whisperLarge.isReady ? .green : .orange)),
             EngineItem(name: "OpenAI 整理", detail: openAISummary.modelName, status: openAISummary.statusText, tint: openAISummary.isRunning ? .blue : (openAISummary.isConfigured ? .green : .orange)),
             EngineItem(name: "说话人分离", detail: speakerDiarizer.modelName, status: speakerDiarizer.statusText, tint: (speakerDiarizer.isRunning || speakerDiarizer.isLiveRunning) ? .blue : (unnamedSpeaker == nil ? .green : .orange)),
             EngineItem(name: "翻译", detail: "多语言到中文", status: selectedMeetingEntries.contains { $0.sourceLanguage != "中文" } ? "已启用" : "待触发", tint: .green),
@@ -732,24 +730,6 @@ final class MeetingStore: ObservableObject {
                 }
             )
             pcmFanout.add(qwenPCMHandler)
-            do {
-                let whisperPCMHandler = try whisperLarge.startLiveTranscription(
-                    meetingDirectoryPath: directoryURL.path,
-                    language: preferredLanguage,
-                    defaultSpeakerID: fallbackSpeakerID(for: meetingID),
-                    onUpdate: { [weak self] update in
-                        self?.applyWhisperLiveTranscription(update, meetingID: meetingID)
-                    },
-                    onError: { [weak self] message in
-                        Task { @MainActor in
-                            self?.lastErrorMessage = message
-                        }
-                    }
-                )
-                pcmFanout.add(whisperPCMHandler)
-            } catch {
-                lastErrorMessage = "Whisper large 未启动：\(error.localizedDescription)"
-            }
             let session = try await recorder.startRecording(
                 meetingID: meetingID,
                 title: title,
@@ -761,7 +741,7 @@ final class MeetingStore: ObservableObject {
             guard let index = meetings.firstIndex(where: { $0.id == meetingID }) else { return }
             meetings[index].storageDirectoryPath = session.directoryURL.path
             meetings[index].audioFilePath = session.audioURL.path
-            meetings[index].subtitle = "正在录音 · Qwen3-ASR 主增强，Whisper large 补漏"
+            meetings[index].subtitle = "正在录音 · Qwen3-ASR 主增强"
             persistMeetingSnapshot(meetings[index])
         } catch {
             guard let index = meetings.firstIndex(where: { $0.id == meetingID }) else { return }
@@ -770,7 +750,6 @@ final class MeetingStore: ObservableObject {
             lastErrorMessage = error.localizedDescription
             streamingTranscriber.stop()
             qwenRefiner.stopLiveEnhancement()
-            whisperLarge.stopLiveTranscription()
             speakerDiarizer.stopLiveDiarization()
         }
     }

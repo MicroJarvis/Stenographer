@@ -260,7 +260,7 @@ struct TranscriptWorkspace: View {
             LiveDraftStrip(
                 draft: store.selectedMeetingLiveDraftEntry,
                 speaker: store.selectedMeetingLiveDraftEntry.map { store.speaker(for: $0.speakerID) },
-                isStreaming: store.streamingTranscriber.isRunning || store.qwenRefiner.isRunning || store.whisperLarge.isRunning || store.speakerDiarizer.isLiveRunning
+                isStreaming: store.streamingTranscriber.isRunning || store.qwenRefiner.isRunning || store.speakerDiarizer.isLiveRunning
             )
             .padding(.horizontal, 24)
             .padding(.vertical, 14)
@@ -407,7 +407,6 @@ struct RecordingHeader: View {
                 EnginePill(title: "录音", value: store.selectedMeeting?.status == .live ? "写入中" : "已保存", systemImage: "record.circle", tint: .red)
                 EnginePill(title: "FunASR ONNX", value: store.transcriptionStatusText, systemImage: "waveform", tint: store.streamingTranscriber.isRunning ? .blue : .secondary)
                 EnginePill(title: "Qwen3-ASR", value: store.qwenRefiner.statusText, systemImage: "wand.and.sparkles", tint: store.qwenRefiner.isRunning ? .blue : .orange)
-                EnginePill(title: "Whisper large", value: store.whisperLarge.statusText, systemImage: "waveform.badge.magnifyingglass", tint: store.whisperLarge.isRunning ? .blue : (store.whisperLarge.isReady ? .green : .orange))
                 EnginePill(
                     title: "声纹",
                     value: (store.speakerDiarizer.isRunning || store.speakerDiarizer.isLiveRunning) ? store.speakerDiarizer.statusText : "\(store.selectedMeeting?.speakerCount ?? 0) 个轨道",
@@ -868,7 +867,7 @@ struct EnginePanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            PanelHeader(title: "本地推理状态", subtitle: "FunASR 负责实时字幕，Qwen3-ASR 作为正文主增强，Whisper large 只补空白片段")
+            PanelHeader(title: "本地推理状态", subtitle: "FunASR 负责实时字幕，Qwen3-ASR 作为正文主增强")
 
             ForEach(store.engineItems()) { item in
                 EngineStatusRow(name: item.name, detail: item.detail, status: item.status, tint: item.tint)
@@ -890,8 +889,6 @@ struct EnginePanel: View {
                 LabeledContent("Nano GGUF", value: store.nanoGGUF.modelDetail)
                 LabeledContent("二遍增强", value: store.qwenRefiner.modelName)
                 LabeledContent("Qwen Python", value: store.qwenRefiner.pythonPath)
-                LabeledContent("Whisper 模型", value: store.whisperLarge.modelPath ?? "下载 ggml-large-v1.bin 到 whisper.cpp/models")
-                LabeledContent("whisper.cpp", value: store.whisperLarge.executablePath ?? "未找到 whisper.cpp/main")
                 LabeledContent("llama-cli", value: store.llama.executablePath ?? "未找到")
                 LabeledContent("GGUF 模型", value: store.llama.modelPath ?? "设置 LLAMA_MODEL 或放到 Models/llm")
                 LabeledContent("上下文窗口", value: "8K tokens")
