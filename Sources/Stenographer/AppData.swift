@@ -756,7 +756,7 @@ final class MeetingStore: ObservableObject {
 
     private func applyStreamingTranscript(_ update: StreamingTranscriptUpdate) {
         guard let selectedMeetingID else { return }
-        let text = update.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = Self.cleanTranscriptDisfluencies(update.text)
         guard !text.isEmpty else { return }
 
         let entry = TranscriptEntry(
@@ -991,8 +991,23 @@ final class MeetingStore: ObservableObject {
     }
 
     private func normalizeTranscript(_ entries: [TranscriptEntry], meetingID: Meeting.ID? = nil) -> [TranscriptEntry] {
-        entries.map { entry in
+        entries.compactMap { entry in
             var normalized = entry
+            let cleanedOriginal = Self.cleanTranscriptDisfluencies(normalized.original)
+            let cleanedTranslation = Self.cleanTranscriptDisfluencies(normalized.translation)
+            let translationMirrorsOriginal = normalized.translation.trimmingCharacters(in: .whitespacesAndNewlines)
+                == normalized.original.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            normalized.original = cleanedOriginal
+            normalized.translation = translationMirrorsOriginal ? cleanedOriginal : cleanedTranslation
+            if normalized.original.isEmpty {
+                normalized.original = normalized.translation
+            }
+            if normalized.translation.isEmpty {
+                normalized.translation = normalized.original
+            }
+            guard !normalized.original.isEmpty else { return nil }
+
             if !speakers.contains(where: { $0.id == normalized.speakerID }) {
                 normalized.speakerID = fallbackSpeakerID(for: meetingID)
             }
@@ -1390,6 +1405,58 @@ final class MeetingStore: ObservableObject {
             }
         }
         return latinCount > max(8, cjkCount * 2)
+    }
+
+    private static func cleanTranscriptDisfluencies(_ text: String) -> String {
+        var cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return "" }
+
+        let pauseFillers = #"嗯+|呃+|额+|啊+|唔+|呣+|诶+|欸+|呃嗯+|嗯呃+|em+|emm+"#
+        let separators = #"[\s，,、。.!！?？；;：:\n]"#
+        let discourseFollowers = #"我|我们|你|你们|他|他们|她|她们|大家|咱们|然后|所以|就是|其实|可能|应该|先|再|还|也"#
+        let patterns: [(pattern: String, template: String, options: NSRegularExpression.Options)] = [
+            (#"^(?:"# + pauseFillers + #")"# + separators + #"*"#, "", []),
+            (#"("# + separators + #")(?:"# + pauseFillers + #")(?:("# + separators + #")+|$)"#, "$1", []),
+            (#"(?:"# + pauseFillers + #")(?=(?:这个|那个|"# + discourseFollowers + #"))"#, "", []),
+            (#"^(?:就是说|就是|怎么说呢|怎么讲呢|对吧|是吧|你知道吧|你知道)"# + separators + #"*"#, "", []),
+            (#"("# + separators + #")(?:就是说|就是|怎么说呢|怎么讲呢|对吧|是吧|你知道吧|你知道)(?:("# + separators + #")+|$)"#, "$1", []),
+            (#"^(?:这个|那个)"# + separators + #"*(?=(?:这个|那个|"# + discourseFollowers + #"))"#, "", []),
+            (#"(?:这个|那个)(?=(?:这个|那个|"# + discourseFollowers + #"))"#, "", []),
+            (#"("# + separators + #")(?:这个|那个)"# + separators + #"*(?=(?:这个|那个|"# + discourseFollowers + #"))"#, "$1", []),
+            (#"^(?:um+|uh+|er+|ah+|hmm+|mmm+|you know|i mean)[\s,，.。!！?？;；:：-]*"#, "", [.caseInsensitive]),
+            (#"(\s|[,，.。!！?？;；:：-])(?:um+|uh+|er+|ah+|hmm+|mmm+|you know|i mean)(?:\s|[,，.。!！?？;；:：-])+"#, "$1", [.caseInsensitive])
+        ]
+
+        var previous = ""
+        var passCount = 0
+        while cleaned != previous && passCount < 6 {
+            previous = cleaned
+            for item in patterns {
+                cleaned = replacingRegex(item.pattern, in: cleaned, with: item.template, options: item.options)
+            }
+            cleaned = tidyTranscriptSpacing(cleaned)
+            passCount += 1
+        }
+        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func replacingRegex(
+        _ pattern: String,
+        in text: String,
+        with template: String,
+        options: NSRegularExpression.Options = []
+    ) -> String {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: options) else { return text }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: template)
+    }
+
+    private static func tidyTranscriptSpacing(_ text: String) -> String {
+        var cleaned = replacingRegex(#"\s+"#, in: text, with: " ")
+        cleaned = replacingRegex(#"\s+([，。！？；：、,.!?;:])"#, in: cleaned, with: "$1")
+        cleaned = replacingRegex(#"([，,、]){2,}"#, in: cleaned, with: "$1")
+        cleaned = replacingRegex(#"^[\s，,、。.!！?？；;：:]+"#, in: cleaned, with: "")
+        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func preferredEntriesForSummary() -> [TranscriptEntry] {
