@@ -330,6 +330,45 @@ final class MeetingStore: ObservableObject {
         }
     }
 
+    func deleteMeeting(_ meetingID: Meeting.ID) {
+        guard let index = meetings.firstIndex(where: { $0.id == meetingID }) else { return }
+        let meeting = meetings[index]
+
+        if meeting.status == .live || meeting.status == .paused {
+            recorder.stopRecording()
+            streamingTranscriber.stop()
+            qwenRefiner.stopLiveEnhancement()
+            whisperLarge.stopLiveTranscription()
+            speakerDiarizer.stopLiveDiarization()
+        }
+
+        do {
+            try MeetingFileStore.shared.deleteMeeting(meeting)
+        } catch {
+            lastErrorMessage = error.localizedDescription
+            return
+        }
+
+        meetings.remove(at: index)
+        transcriptByMeeting[meetingID] = nil
+        summaryByMeeting[meetingID] = nil
+        liveStreamingEntryByMeeting[meetingID] = nil
+        qwenLiveEntriesByMeeting[meetingID] = nil
+        whisperLiveEntriesByMeeting[meetingID] = nil
+        liveSpeakerEntriesByMeeting[meetingID] = nil
+        placeholderSpeakerIDsByMeeting[meetingID] = nil
+        if pendingSpeakerMergeSourceID.map({ !selectedMeetingSpeakerIDs.contains($0) }) == true {
+            pendingSpeakerMergeSourceID = nil
+            pendingSpeakerMergeTargetID = nil
+        }
+
+        if selectedMeetingID == meetingID {
+            selectedMeetingID = meetings.indices.contains(index)
+                ? meetings[index].id
+                : meetings.first?.id
+        }
+    }
+
     func togglePauseSelectedMeeting() {
         guard let status = selectedMeeting?.status else { return }
 

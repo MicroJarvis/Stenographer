@@ -166,6 +166,13 @@ final class MeetingFileStore {
         .sorted { $0.meeting.createdAt > $1.meeting.createdAt }
     }
 
+    func deleteMeeting(_ meeting: Meeting) throws {
+        guard let directoryPath = meeting.storageDirectoryPath else { return }
+        let directoryURL = URL(fileURLWithPath: directoryPath, isDirectory: true)
+        guard fileManager.fileExists(atPath: directoryURL.path) else { return }
+        try fileManager.removeItem(at: directoryURL)
+    }
+
     private func writeEmptyJSONFiles(in directoryURL: URL) throws {
         try write([TranscriptEntry](), to: directoryURL.appendingPathComponent("transcript.json"))
         try write([SummaryPoint](), to: directoryURL.appendingPathComponent("summary.json"))

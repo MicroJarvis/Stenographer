@@ -115,6 +115,7 @@ struct SidebarView: View {
     @ObservedObject var store: MeetingStore
     @Binding var searchText: String
     var openVoiceprintLibrary: () -> Void
+    @State private var meetingPendingDeletion: Meeting?
 
     var body: some View {
         List(selection: $store.selectedMeetingID) {
@@ -140,40 +141,88 @@ struct SidebarView: View {
 
             Section("最近会议") {
                 ForEach(store.filteredMeetings(matching: searchText)) { meeting in
-                    MeetingRow(meeting: meeting)
+                    MeetingRow(
+                        meeting: meeting,
+                        deleteAction: {
+                            meetingPendingDeletion = meeting
+                        }
+                    )
                         .tag(meeting.id)
+                        .contextMenu {
+                            Button(role: .destructive) {
+                                meetingPendingDeletion = meeting
+                            } label: {
+                                Label("删除会议", systemImage: "trash")
+                            }
+                            .disabled(meeting.status == .live || meeting.status == .paused)
+                        }
                 }
             }
         }
         .searchable(text: $searchText, prompt: "搜索会议、发言人或关键词")
         .navigationTitle("Stenographer")
+        .alert("删除会议？", isPresented: deleteAlertIsPresented, presenting: meetingPendingDeletion) { meeting in
+            Button("删除", role: .destructive) {
+                store.deleteMeeting(meeting.id)
+                meetingPendingDeletion = nil
+            }
+            Button("取消", role: .cancel) {
+                meetingPendingDeletion = nil
+            }
+        } message: { meeting in
+            Text("这会删除“\(meeting.title)”及其本地录音、转写和整理结果。")
+        }
+    }
+
+    private var deleteAlertIsPresented: Binding<Bool> {
+        Binding(
+            get: { meetingPendingDeletion != nil },
+            set: { isPresented in
+                if !isPresented {
+                    meetingPendingDeletion = nil
+                }
+            }
+        )
     }
 }
 
 struct MeetingRow: View {
     let meeting: Meeting
+    var deleteAction: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text(meeting.title)
-                    .font(.headline)
+        HStack(alignment: .center, spacing: 8) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text(meeting.title)
+                        .font(.headline)
+                        .lineLimit(1)
+                    Spacer()
+                    StatusDot(status: meeting.status)
+                }
+
+                Text(meeting.subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
-                Spacer()
-                StatusDot(status: meeting.status)
-            }
 
-            Text(meeting.subtitle)
-                .font(.caption)
+                HStack(spacing: 8) {
+                    Label(meeting.duration, systemImage: "clock")
+                    Label("\(meeting.speakerCount) 人", systemImage: "person.2")
+                }
+                .font(.caption2)
                 .foregroundStyle(.secondary)
-                .lineLimit(1)
-
-            HStack(spacing: 8) {
-                Label(meeting.duration, systemImage: "clock")
-                Label("\(meeting.speakerCount) 人", systemImage: "person.2")
             }
-            .font(.caption2)
-            .foregroundStyle(.secondary)
+
+            Button(role: .destructive) {
+                deleteAction()
+            } label: {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.small)
+            .help("删除会议")
+            .disabled(meeting.status == .live || meeting.status == .paused)
         }
         .padding(.vertical, 6)
     }
